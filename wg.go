@@ -20,9 +20,17 @@ import (
 	"github.com/urnetwork/userwireguard/logger"
 )
 
-// FIXME currently the client ipv4 is threaded to the egress providers
-//       this can allow tracing a single client ipv4 across multiple providers
-//       it should be natted to a standard ipv4
+// The client ipv4 below is the peer's tunnel address inside this server. It is
+// NOT what reaches the egress providers: `server/proxy.ProxyDevice` substitutes
+// a per-device address from connect's local pool on the way out and restores
+// this one on the way back (see its natAddr, and connect.RewriteIpv4Source).
+//
+// That rewrite is load-bearing rather than cosmetic. A peer's tunnel address is
+// allocated from a durable pool and written into its wg config, so threading it
+// through unmodified made it stable across sessions AND identical at every
+// provider in the peer's window -- which let colluding providers tell that
+// those flows belonged to one client, defeating the multi-provider window for
+// this path alone. Threat model §9.4.
 
 var DidNotSendError = errors.New("did not send")
 var PacketTooLargeError = errors.New("packet too large for buffer")
@@ -54,12 +62,39 @@ type WgTun interface {
 	Cancel()
 }
 
+// WgAddressTun lets a shared packet tunnel route only one WireGuard peer's
+// return address to WgProxy while its other consumers remain active. Legacy
+// WgTun implementations still receive the process-wide channel through
+// SetReceive; production hosted devices implement this address-aware form so
+// HTTP, SOCKS, and WireGuard can use one proxy device concurrently.
+type WgAddressTun interface {
+	WgTun
+	SetReceiveForAddress(netip.Addr, chan []byte)
+}
+
+func setWgTunReceive(tun WgTun, addr netip.Addr, receive chan []byte) {
+	if addressTun, ok := tun.(WgAddressTun); ok {
+		addressTun.SetReceiveForAddress(addr, receive)
+		return
+	}
+	tun.SetReceive(receive)
+}
+
+// Optionally accepts one borrowed packet list. The implementation must copy
+// before returning if its asynchronous send retains packet bytes.
+type WgBatchTun interface {
+	WgTun
+	SendBorrowedBatch([][]byte, int) int
+}
+
 func DefaultWgProxySettings() *WgProxySettings {
 	return &WgProxySettings{
-		ReceiveSequenceSize: 1024,
-		EventsSequenceSize:  16,
-		CheckTunIdleTimeout: 1 * time.Minute,
-		ClientBatchSize:     256,
+		ReceiveSequenceSize:     1024,
+		EventsSequenceSize:      16,
+		CheckTunIdleTimeout:     1 * time.Minute,
+		ClientBatchSize:         256,
+		UploadPacketBatchSize:   8,
+		DownloadPacketBatchSize: 64,
 	}
 }
 
@@ -77,6 +112,10 @@ type WgProxySettings struct {
 	// failing peer drops at most one batch (which is then retried per peer)
 	// rather than the entire set
 	ClientBatchSize int
+	// Maximum borrowed packets handed to one asynchronous Connect upload.
+	UploadPacketBatchSize int
+	// Maximum already-ready packets returned by one WireGuard read.
+	DownloadPacketBatchSize int
 }
 
 // implements wg device:
@@ -92,6 +131,10 @@ type WgProxy struct {
 
 	events  chan uwgtun.Event
 	receive chan []byte
+	// Event sends finish or observe cancellation before the tun closes events.
+	// This lock is independent of every packet and client-map operation.
+	eventsLock   sync.RWMutex
+	eventsClosed bool
 
 	device *device.Device
 
@@ -114,6 +157,14 @@ type WgProxy struct {
 	activeClients  map[netip.Addr]WgTun
 
 	closeActiveClientsOnce sync.Once
+}
+
+// WgRuntimeStats is process-local receive health without peer identity. The
+// values are cumulative for one WireGuard device generation.
+type WgRuntimeStats struct {
+	InboundPeerQueueDropPacketCount       uint64
+	InboundDecryptionQueueDropPacketCount uint64
+	ReceiveRoutineFailureCount            uint64
 }
 
 type wgTunDevice struct {
@@ -140,8 +191,16 @@ func (self *wgTunDevice) AddEvent(event uwgtun.Event) {
 	self.proxy.AddEvent(event)
 }
 
+// The tun owns the event channel; closing it releases WireGuard's event reader.
+// Cancel first so a sender blocked on a full channel can release its read lock.
 func (self *wgTunDevice) Close() error {
 	self.proxy.cancel()
+	self.proxy.eventsLock.Lock()
+	defer self.proxy.eventsLock.Unlock()
+	if !self.proxy.eventsClosed {
+		self.proxy.eventsClosed = true
+		close(self.proxy.events)
+	}
 	return nil
 }
 
@@ -297,23 +356,23 @@ func (self *WgProxy) SetClients(clients map[netip.Addr]*WgClient) (returnErr err
 	}()
 	for _, a := range actives {
 		if a.client == nil {
-			a.activeTun.SetReceive(nil)
+			setWgTunReceive(a.activeTun, a.addr, nil)
 			a.activeTun.Cancel()
 			self.removeActiveClient(a.addr, a.activeTun)
 			continue
 		}
 		tun, err := a.client.Tun()
 		if err != nil {
-			a.activeTun.SetReceive(nil)
+			setWgTunReceive(a.activeTun, a.addr, nil)
 			a.activeTun.Cancel()
 			self.removeActiveClient(a.addr, a.activeTun)
 			returnErr = errors.Join(returnErr, err)
 			continue
 		}
 		if tun != a.activeTun {
-			a.activeTun.SetReceive(nil)
+			setWgTunReceive(a.activeTun, a.addr, nil)
 			a.activeTun.Cancel()
-			tun.SetReceive(self.receive)
+			setWgTunReceive(tun, a.addr, self.receive)
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
@@ -429,6 +488,15 @@ func (self *WgProxy) ClientCount() int {
 	self.stateLock.RLock()
 	defer self.stateLock.RUnlock()
 	return len(self.clients)
+}
+
+// RuntimeStats exposes the shared UDP receive boundary for server metrics.
+func (self *WgProxy) RuntimeStats() WgRuntimeStats {
+	return WgRuntimeStats{
+		InboundPeerQueueDropPacketCount:       self.device.InboundPeerQueueDropPacketCount(),
+		InboundDecryptionQueueDropPacketCount: self.device.InboundDecryptionQueueDropPacketCount(),
+		ReceiveRoutineFailureCount:            self.device.ReceiveRoutineFailureCount(),
+	}
 }
 
 // WgPeerStatus is a registered client's live peer session facts: the endpoint
@@ -607,7 +675,11 @@ func (self *WgProxy) RemoveClients(addedBefore time.Time, addrs ...netip.Addr) (
 
 	// forget the clients whose peers were removed, capturing any active tuns to
 	// tear down once the lock is released
-	var activeTuns []WgTun
+	type activeTunRemoval struct {
+		addr netip.Addr
+		tun  WgTun
+	}
+	var activeTuns []activeTunRemoval
 	forget := func(batch []removal) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -615,7 +687,7 @@ func (self *WgProxy) RemoveClients(addedBefore time.Time, addrs ...netip.Addr) (
 			delete(self.clients, entry.addr)
 			delete(self.clientAddTimes, entry.addr)
 			if t, ok := self.activeClients[entry.addr]; ok {
-				activeTuns = append(activeTuns, t)
+				activeTuns = append(activeTuns, activeTunRemoval{addr: entry.addr, tun: t})
 				delete(self.activeClients, entry.addr)
 			}
 		}
@@ -656,8 +728,8 @@ func (self *WgProxy) RemoveClients(addedBefore time.Time, addrs ...netip.Addr) (
 	}
 
 	for _, activeTun := range activeTuns {
-		activeTun.SetReceive(nil)
-		activeTun.Cancel()
+		setWgTunReceive(activeTun.tun, activeTun.addr, nil)
+		activeTun.tun.Cancel()
 	}
 	return
 }
@@ -673,11 +745,10 @@ func (self *WgProxy) activateClient(addr netip.Addr) (WgTun, error) {
 	tun := self.activeClients[addr]
 	self.stateLock.RUnlock()
 	if tun != nil && tun.Active() && tun.UpdateActivity() {
-		// Re-assert wg "receive" mode on each call. The proxy device is shared per
-		// proxy id, so a tun-based call (http/socks) may have reset it to tun mode
-		// via SetReceive(nil). The device's SetReceive is idempotent when the
-		// channel is unchanged, so this is free in the common case.
-		tun.SetReceive(self.receive)
+		// Re-assert the address attachment on each call. Address-aware devices keep
+		// Tun traffic independent; legacy implementations may still use a global
+		// mode. Both attachment forms are idempotent in the common case.
+		setWgTunReceive(tun, addr, self.receive)
 		return tun, nil
 	}
 	return self.activateClientSlow(addr)
@@ -701,7 +772,7 @@ func (self *WgProxy) activateClientSlow(addr netip.Addr) (WgTun, error) {
 		return nil, err
 	}
 	tun.UpdateActivity()
-	tun.SetReceive(self.receive)
+	setWgTunReceive(tun, addr, self.receive)
 
 	self.stateLock.Lock()
 	// the client may have been removed while the device was being created
@@ -709,7 +780,7 @@ func (self *WgProxy) activateClientSlow(addr netip.Addr) (WgTun, error) {
 	// publish a tun for it
 	if _, stillClient := self.clients[addr]; !stillClient {
 		self.stateLock.Unlock()
-		tun.SetReceive(nil)
+		setWgTunReceive(tun, addr, nil)
 		tun.Cancel()
 		return nil, fmt.Errorf("No client found for %s.", addr)
 	}
@@ -726,7 +797,14 @@ func (self *WgProxy) Events() <-chan uwgtun.Event {
 	return self.events
 }
 
+// Retains event ownership until admission or cancellation. The close guard
+// prevents a select from choosing a send on the already-closed channel.
 func (self *WgProxy) AddEvent(event uwgtun.Event) {
+	self.eventsLock.RLock()
+	defer self.eventsLock.RUnlock()
+	if self.eventsClosed || self.ctx.Err() != nil {
+		return
+	}
 	select {
 	case <-self.ctx.Done():
 	case self.events <- event:
@@ -734,40 +812,115 @@ func (self *WgProxy) AddEvent(event uwgtun.Event) {
 }
 
 func (self *WgProxy) BatchSize() int {
-	return 1
+	return max(self.uploadPacketBatchSize(), self.downloadPacketBatchSize())
+}
+
+// Resolves the measured directional default to at least one packet.
+func (self *WgProxy) uploadPacketBatchSize() int {
+	return max(1, self.settings.UploadPacketBatchSize)
+}
+
+// Resolves the measured directional default to at least one packet.
+func (self *WgProxy) downloadPacketBatchSize() int {
+	return max(1, self.settings.DownloadPacketBatchSize)
 }
 
 // `uwgtun.Device` implementation
 func (self *WgProxy) Write(bufs [][]byte, offset int) (count int, returnErr error) {
+	if len(bufs) == 0 {
+		return
+	}
+	firstSourceAddr := netip.Addr{}
+	homogeneousSource := true
 	for _, buf := range bufs {
-		packet := buf[offset:]
-		// packet := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
-
-		err := func() error {
-			ipPath, err := connect.ParseIpPath(packet)
-			if err != nil {
-				return err
-			}
-			sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
-			if !ok {
-				return fmt.Errorf("Unknown source ip")
-			}
-			tun, err := self.activateClient(sourceAddr)
-			if err != nil {
-				return err
-			}
-			success := tun.Send(packet)
-			if !success {
-				return DidNotSendError
-			}
-			return nil
-		}()
-
-		if err == nil {
-			count += 1
-		} else {
-			returnErr = errors.Join(returnErr, err)
+		if len(buf) < offset {
+			homogeneousSource = false
+			break
 		}
+		ipPath, err := connect.ParseIpPath(buf[offset:])
+		if err != nil {
+			homogeneousSource = false
+			break
+		}
+		sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
+		if !ok {
+			homogeneousSource = false
+			break
+		}
+		if !firstSourceAddr.IsValid() {
+			firstSourceAddr = sourceAddr
+		} else if sourceAddr != firstSourceAddr {
+			homogeneousSource = false
+			break
+		}
+	}
+	send := func(sourceAddr netip.Addr, packets [][]byte, packetOffset int) {
+		tun, err := self.activateClient(sourceAddr)
+		if err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		if batchTun, ok := tun.(WgBatchTun); ok {
+			batchSize := self.uploadPacketBatchSize()
+			for packetStart := 0; packetStart < len(packets); packetStart += batchSize {
+				packetEnd := min(packetStart+batchSize, len(packets))
+				batchPackets := packets[packetStart:packetEnd]
+				sentPacketCount := batchTun.SendBorrowedBatch(batchPackets, packetOffset)
+				count += sentPacketCount
+				if sentPacketCount != len(batchPackets) {
+					returnErr = errors.Join(returnErr, DidNotSendError)
+				}
+			}
+			return
+		}
+		for _, packet := range packets {
+			if tun.Send(packet[packetOffset:]) {
+				count += 1
+			} else {
+				returnErr = errors.Join(returnErr, DidNotSendError)
+			}
+		}
+	}
+	if homogeneousSource && firstSourceAddr.IsValid() {
+		send(firstSourceAddr, bufs, offset)
+		return
+	}
+
+	type borrowedPacketGroup struct {
+		sourceAddr netip.Addr
+		packets    [][]byte
+	}
+	groups := []*borrowedPacketGroup{}
+	sourceAddrGroup := map[netip.Addr]*borrowedPacketGroup{}
+	for _, buf := range bufs {
+		if len(buf) < offset {
+			returnErr = errors.Join(returnErr, fmt.Errorf("packet offset %d exceeds buffer size %d", offset, len(buf)))
+			continue
+		}
+		packet := buf[offset:]
+		ipPath, err := connect.ParseIpPath(packet)
+		if err != nil {
+			returnErr = errors.Join(returnErr, err)
+			continue
+		}
+		sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
+		if !ok {
+			returnErr = errors.Join(returnErr, fmt.Errorf("unknown source ip"))
+			continue
+		}
+		group := sourceAddrGroup[sourceAddr]
+		if group == nil {
+			group = &borrowedPacketGroup{
+				sourceAddr: sourceAddr,
+				packets:    make([][]byte, 0, len(bufs)),
+			}
+			sourceAddrGroup[sourceAddr] = group
+			groups = append(groups, group)
+		}
+		group.packets = append(group.packets, packet)
+	}
+	for _, group := range groups {
+		send(group.sourceAddr, group.packets, 0)
 	}
 	return
 }
@@ -775,21 +928,40 @@ func (self *WgProxy) Write(bufs [][]byte, offset int) (count int, returnErr erro
 // `uwgtun.Device` implementation
 // note that `userwireguard` does not use `connect.MessagPool*`
 func (self *WgProxy) Read(bufs [][]byte, sizes []int, offset int) (count int, returnErr error) {
-	select {
-	case <-self.ctx.Done():
-		return 0, fmt.Errorf("Done.")
-	case packet := <-self.receive:
-		// ownership transferred to us on the successful send; copy into the
-		// device buffer and return the shared packet to the pool.
-		n := copy(bufs[0][offset:], packet)
+	maximumPacketCount := min(len(bufs), len(sizes), self.downloadPacketBatchSize())
+	if maximumPacketCount == 0 {
+		return 0, PacketTooLargeError
+	}
+	for _, buf := range bufs[:maximumPacketCount] {
+		if len(buf) < offset {
+			return 0, PacketTooLargeError
+		}
+	}
+	copyPacket := func(packet []byte) {
+		n := copy(bufs[count][offset:], packet)
 		connect.MessagePoolReturn(packet)
 		if n < len(packet) {
 			returnErr = errors.Join(returnErr, PacketTooLargeError)
 		}
-		sizes[0] = n
+		sizes[count] = n
 		count += 1
-		return
 	}
+
+	select {
+	case <-self.ctx.Done():
+		return 0, fmt.Errorf("done")
+	case packet := <-self.receive:
+		copyPacket(packet)
+	}
+	for count < maximumPacketCount {
+		select {
+		case packet := <-self.receive:
+			copyPacket(packet)
+		default:
+			return
+		}
+	}
+	return
 }
 
 // `uwgtun.Device` implementation
@@ -815,8 +987,8 @@ func (self *WgProxy) closeActiveClients() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
-		for _, activeTun := range self.activeClients {
-			activeTun.SetReceive(nil)
+		for addr, activeTun := range self.activeClients {
+			setWgTunReceive(activeTun, addr, nil)
 			activeTun.Cancel()
 		}
 		clear(self.activeClients)
